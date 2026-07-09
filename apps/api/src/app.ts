@@ -212,6 +212,16 @@ if (env.CLOUD_MODE) {
   const sweepStaleRestores = repos.backupRestore.sweepStaleRestores(
     "API restart while restore in flight",
   );
+  // A deploy is an in-process task driven by an in-memory build session, so a
+  // restart orphans any deployment still building/deploying/queued — the UI
+  // would otherwise hang on "Building" forever. Flip those to cancelled at boot
+  // (reconciling is left for the reconcile scheduler). Fire-and-forget.
+  void repos.deployment
+    .sweepStaleInFlight("Interrupted by a server restart — redeploy to try again.")
+    .then((n) => {
+      if (n > 0) console.log(`[boot] cancelled ${n} stale in-flight deployment(s)`);
+    })
+    .catch((err) => console.warn("[boot] sweepStaleInFlight failed:", err));
   // A project's deletionInProgress flag can only survive from a teardown that
   // died mid-flight (no teardown outlives a restart), so clear stuck locks at
   // boot — otherwise the project refuses all deletes forever ("Another delete

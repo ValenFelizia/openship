@@ -1,4 +1,4 @@
-import { eq, and, desc, inArray, ne, sql } from "drizzle-orm";
+import { eq, and, desc, inArray, isNull, ne, sql } from "drizzle-orm";
 import { generateId } from "@repo/core";
 import type { Database } from "../client";
 import { deployment, buildSession } from "../schema";
@@ -186,6 +186,42 @@ export function createDeploymentRepo(db: Database) {
             ne(deployment.id, exceptId),
           ),
         );
+    },
+
+    /**
+     * Boot sweep: a deploy runs as an in-process background task driven by the
+     * in-memory build session. A restart kills that session, so any deployment
+     * still `queued`/`building`/`deploying` at boot is ORPHANED — nothing will
+     * ever advance it, and the UI hangs on "Building" forever. Flip those (and
+     * finalize their build_session, which the detail view reads for status) to a
+     * terminal `cancelled` so the operator can just redeploy.
+     *
+     * `reconciling` is deliberately EXCLUDED — a connection-loss deploy may be
+     * running fine on the host; the reconcile scheduler settles it separately.
+     * Returns the number of deployments swept.
+     */
+    async sweepStaleInFlight(reason: string): Promise<number> {
+      const swept = await db
+        .update(deployment)
+        .set({ status: "cancelled", errorMessage: reason, updatedAt: new Date() })
+        .where(inArray(deployment.status, ["queued", "building", "deploying"]))
+        .returning();
+
+      if (swept.length > 0) {
+        await db
+          .update(buildSession)
+          .set({ status: "cancelled", finishedAt: new Date() })
+          .where(
+            and(
+              inArray(
+                buildSession.deploymentId,
+                swept.map((row) => row.id),
+              ),
+              isNull(buildSession.finishedAt),
+            ),
+          );
+      }
+      return swept.length;
     },
 
     async setContainerId(id: string, containerId: string, url?: string) {
