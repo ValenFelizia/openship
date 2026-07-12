@@ -19,7 +19,7 @@ import type {
   SshConfig,
 } from "../types";
 import { logEntry, sq } from "./local-shell";
-import { extractRemoteArchive, packLocalArchive } from "./remote-transfer";
+import { canUseRemoteRsync, extractRemoteArchive, packLocalArchive, uploadFileWithRsync } from "./remote-transfer";
 import {
   buildBaseSshArgs,
   makeControlPath,
@@ -323,9 +323,10 @@ export class SystemSshExecutor implements CommandExecutor {
     onLog?: (log: LogEntry) => void,
     options?: { excludes?: string[]; includes?: string[] },
   ): Promise<void> {
-    // Pack the tree into ONE archive, stream that single file over the existing
-    // OpenSSH ControlMaster (multiplexed channel, no new handshake, no rsync,
-    // no per-file overhead), then verify + extract on the server.
+    // Pack the tree into ONE archive, upload that single file, verify + extract.
+    // rsync (fast + resumable) over the agent-authenticated OpenSSH client when
+    // available; otherwise stream the file over the existing ControlMaster.
+    const deps = { config: this.config, hasRemoteCommand: (c: string) => this.hasRemoteCommand(c) };
     const excludes = options?.excludes ?? [...TRANSFER_EXCLUDES];
     const tarArgs = getTarCreateArgs(localPath, { excludes, includes: options?.includes });
     const tmpLocalDir = await mkdtemp(join(tmpdir(), "openship-xfer-"));
@@ -338,12 +339,54 @@ export class SystemSshExecutor implements CommandExecutor {
       await packLocalArchive(tarArgs, localArchive);
       const totalBytes = (await stat(localArchive)).size;
       await this.exec(`mkdir -p ${sq(dirname(remoteArchive))}`);
-      onLog?.(logEntry(`Uploading ${formatBytes(totalBytes)} archive over the SSH connection...`));
-      const { code } = await this.pipeLocal(`cat ${sq(localArchive)}`, `cat > ${sq(remoteArchive)}`, onLog);
-      if (code !== 0) throw new Error(`archive upload failed (exit ${code})`);
+
+      const rsync = await canUseRemoteRsync(deps);
+      if (rsync.ok) {
+        onLog?.(logEntry(`Uploading ${formatBytes(totalBytes)} archive via rsync (resumable)...`));
+        await uploadFileWithRsync(localArchive, remoteArchive, deps, onLog);
+      } else {
+        // No rsync → stream over the master. The `cat >` truncates, so this
+        // restarts (not resumes) on failure; bounded retry.
+        onLog?.(
+          logEntry(`Uploading ${formatBytes(totalBytes)} archive over the SSH connection — ${rsync.reason}.`),
+        );
+        await this.streamArchiveWithRetry(localArchive, remoteArchive, onLog);
+      }
+
       await extractRemoteArchive((command) => this.exec(command), remoteArchive, remotePath, totalBytes, onLog);
     } finally {
       await fsRm(tmpLocalDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /** Stream a single local file over the ControlMaster, retrying from 0 on
+   *  failure (the `cat >` truncates, so there is no partial to resume). */
+  private async streamArchiveWithRetry(
+    localArchive: string,
+    remoteArchive: string,
+    onLog?: (log: LogEntry) => void,
+  ): Promise<void> {
+    const MAX_ATTEMPTS = 3;
+    let lastErr: Error | null = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (attempt > 1) onLog?.(logEntry(`Retrying upload (attempt ${attempt}/${MAX_ATTEMPTS})...`, "warn"));
+      try {
+        const { code } = await this.pipeLocal(`cat ${sq(localArchive)}`, `cat > ${sq(remoteArchive)}`, onLog);
+        if (code === 0) return;
+        lastErr = new Error(`archive upload failed (exit ${code})`);
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+    throw lastErr ?? new Error("archive upload failed");
+  }
+
+  private async hasRemoteCommand(command: string): Promise<boolean> {
+    try {
+      const out = await this.exec(`command -v ${command} >/dev/null 2>&1 && echo ok`, { timeout: 5_000 });
+      return out.trim() === "ok";
+    } catch {
+      return false;
     }
   }
 

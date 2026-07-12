@@ -1,3 +1,4 @@
+import { createReadStream } from "node:fs";
 import { mkdtemp, rm as fsRm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,7 +12,7 @@ import type {
   SshConfig,
 } from "../types";
 import { logEntry, sq } from "./local-shell";
-import { extractRemoteArchive, packLocalArchive } from "./remote-transfer";
+import { canUseRemoteRsync, extractRemoteArchive, packLocalArchive, uploadFileWithRsync } from "./remote-transfer";
 import type { Client as SshClient, SFTPWrapper } from "ssh2";
 import type { Readable, Duplex } from "node:stream";
 import { connectSshClient, openSftp, openSshUnixSocket, type StreamLocalCapableClient } from "./ssh-client";
@@ -489,9 +490,10 @@ export class SshExecutor implements CommandExecutor {
     onLog?: (log: LogEntry) => void,
     options?: { excludes?: string[]; includes?: string[] },
   ): Promise<void> {
-    // Pack the tree into ONE archive, upload that single file via SFTP fastPut
-    // (concurrent chunks over the existing ssh2 connection — no rsync, no
-    // sshpass, no per-file overhead), then verify + extract on the server.
+    // Pack the tree into ONE archive, upload that single file, verify + extract.
+    // Transport: rsync (fast + resumable) when the toolchain allows; otherwise
+    // ssh2 SFTP, made stall-proof + resumable on our side.
+    const deps = { config: this.config, hasRemoteCommand: (c: string) => this.hasRemoteCommand(c) };
     const excludes = options?.excludes ?? [...TRANSFER_EXCLUDES];
     const tarArgs = getTarCreateArgs(localPath, { excludes, includes: options?.includes });
     const tmpLocalDir = await mkdtemp(join(tmpdir(), "openship-xfer-"));
@@ -504,45 +506,146 @@ export class SshExecutor implements CommandExecutor {
       await packLocalArchive(tarArgs, localArchive);
       const totalBytes = (await stat(localArchive)).size;
       await this.exec(`mkdir -p ${sq(dirname(remoteArchive))}`);
-      onLog?.(logEntry(`Uploading ${formatBytes(totalBytes)} archive via SFTP (concurrent)...`));
-      await this.sftpFastPut(localArchive, remoteArchive, totalBytes, onLog);
+
+      const rsync = await canUseRemoteRsync(deps);
+      if (rsync.ok) {
+        onLog?.(logEntry(`Uploading ${formatBytes(totalBytes)} archive via rsync (resumable)...`));
+        await uploadFileWithRsync(localArchive, remoteArchive, deps, onLog);
+      } else {
+        onLog?.(
+          logEntry(`Uploading ${formatBytes(totalBytes)} archive via SFTP (resumable) — ${rsync.reason}.`),
+        );
+        await this.sftpUploadResumable(localArchive, remoteArchive, totalBytes, onLog);
+      }
+
       await extractRemoteArchive((command) => this.exec(command), remoteArchive, remotePath, totalBytes, onLog);
     } finally {
       await fsRm(tmpLocalDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
-  /** SFTP fastPut with concurrency + a throttled progress heartbeat. */
-  private async sftpFastPut(
+  private async hasRemoteCommand(command: string): Promise<boolean> {
+    try {
+      await this.exec(`command -v ${command} >/dev/null 2>&1 && echo ok`, { timeout: 5_000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Resumable SFTP upload (the fallback when rsync isn't available — password
+   * auth with no `sshpass`). Each attempt `stat`s the remote to learn how much
+   * already landed and streams the REST from that offset (append), so a dropped
+   * or stalled connection continues instead of restarting from 0. A watchdog
+   * aborts the attempt if no bytes flow for `STALL_MS`, and the loop retries
+   * (resuming) up to `MAX_ATTEMPTS`.
+   */
+  private async sftpUploadResumable(
     localArchive: string,
     remoteArchive: string,
     totalBytes: number,
     onLog?: (log: LogEntry) => void,
   ): Promise<void> {
-    const sftp = await this.sftp();
-    const startedAt = Date.now();
-    let lastReportedAt = startedAt;
-    await new Promise<void>((resolve, reject) => {
-      sftp.fastPut(
-        localArchive,
-        remoteArchive,
-        {
-          concurrency: 16,
-          chunkSize: 32768,
-          step: (transferred: number) => {
-            const now = Date.now();
-            if (now - lastReportedAt < 2500) return;
-            lastReportedAt = now;
-            const elapsed = (now - startedAt) / 1000;
-            const mbps = elapsed > 0 ? transferred / 1024 / 1024 / elapsed : 0;
-            const pct = totalBytes > 0 ? Math.min(Math.floor((transferred / totalBytes) * 100), 100) : 0;
-            onLog?.(
-              logEntry(`  ~${pct}% · ${formatBytes(transferred)} · ${mbps.toFixed(1)} MB/s · ${elapsed.toFixed(0)}s`),
-            );
-          },
-        },
-        (err) => (err ? reject(err) : resolve()),
+    const MAX_ATTEMPTS = 4;
+    const STALL_MS = 30_000;
+    let lastErr: Error | null = null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const sftp = await this.sftp();
+
+      // Resume point = bytes already on the remote from a prior attempt.
+      let offset = 0;
+      try {
+        const size = await new Promise<number>((resolve, reject) =>
+          sftp.stat(remoteArchive, (err, stats) => (err ? reject(err) : resolve(stats.size))),
+        );
+        if (size === totalBytes) return; // already fully uploaded
+        if (size < totalBytes) offset = size; // resume from here (size > total → restart at 0)
+      } catch {
+        offset = 0; // no remote file yet
+      }
+
+      if (attempt > 1 || offset > 0) {
+        onLog?.(
+          logEntry(
+            `Resuming SFTP upload from ${formatBytes(offset)} (attempt ${attempt}/${MAX_ATTEMPTS})...`,
+            "warn",
+          ),
+        );
+      }
+
+      try {
+        await this.sftpStreamFrom(sftp, localArchive, remoteArchive, offset, totalBytes, STALL_MS, onLog);
+        return;
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        onLog?.(logEntry(`SFTP upload interrupted: ${lastErr.message}`, "warn"));
+      }
+    }
+
+    throw lastErr ?? new Error("SFTP upload failed");
+  }
+
+  /** Stream `localArchive` (from `offset`) into `remoteArchive`, appending when
+   *  resuming. Rejects on error, on a stall (no bytes for `stallMs`), or if the
+   *  stream closes before `totalBytes` land. */
+  private sftpStreamFrom(
+    sftp: SFTPWrapper,
+    localArchive: string,
+    remoteArchive: string,
+    offset: number,
+    totalBytes: number,
+    stallMs: number,
+    onLog?: (log: LogEntry) => void,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const read = createReadStream(localArchive, { start: offset });
+      const write = sftp.createWriteStream(remoteArchive, { flags: offset > 0 ? "a" : "w" });
+      let transferred = offset;
+      let lastProgressAt = Date.now();
+      const startedAt = Date.now();
+      let lastReportedAt = startedAt;
+      let settled = false;
+
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(watch);
+        fn();
+      };
+
+      const watch = setInterval(() => {
+        if (Date.now() - lastProgressAt > stallMs) {
+          read.destroy();
+          write.end();
+          finish(() => reject(new Error(`stalled — no data for ${Math.round(stallMs / 1000)}s`)));
+        }
+      }, 5_000);
+      (watch as { unref?: () => void }).unref?.();
+
+      read.on("data", (chunk: string | Buffer) => {
+        transferred += chunk.length;
+        lastProgressAt = Date.now();
+        const now = Date.now();
+        if (now - lastReportedAt >= 2500) {
+          lastReportedAt = now;
+          const elapsed = (now - startedAt) / 1000;
+          const mbps = elapsed > 0 ? (transferred - offset) / 1024 / 1024 / elapsed : 0;
+          const pct = totalBytes > 0 ? Math.min(Math.floor((transferred / totalBytes) * 100), 100) : 0;
+          onLog?.(logEntry(`  ~${pct}% · ${formatBytes(transferred)} · ${mbps.toFixed(1)} MB/s`));
+        }
+      });
+      read.on("error", (e) => finish(() => reject(e)));
+      write.on("error", (e: Error) => finish(() => reject(e)));
+      write.on("close", () =>
+        finish(() =>
+          transferred >= totalBytes
+            ? resolve()
+            : reject(new Error(`incomplete upload: ${transferred}/${totalBytes} bytes`)),
+        ),
       );
+      read.pipe(write);
     });
   }
 }
