@@ -17,7 +17,7 @@
  * comes from the `useDeploymentInfo` hook instead of `usePlatform`.
  */
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Loader2, Boxes, AlertCircle, Lock, Building2 } from "lucide-react";
 import { authClient, useSession } from "@/lib/auth-client";
@@ -84,15 +84,17 @@ function McpAuthorizeInner() {
   const { data: session, isPending } = useSession();
 
   const clientId = searchParams.get("client_id");
-  const scope = searchParams.get("scope") ?? "";
   const consentCode = searchParams.get("consent_code");
-  const scopes = useMemo(() => scope.split(/[\s+]+/).filter(Boolean), [scope]);
 
   const [submitting, setSubmitting] = useState<null | "accept" | "deny">(null);
   const [error, setError] = useState<string | null>(null);
 
   const [readOnly, setReadOnly] = useState(false);
   const [grants, setGrants] = useState<PickerGrant[]>([]);
+  // Explicit access mode so what's granted is obvious. full = act with the
+  // user's own role (no resource grants); limited = scope to the picked
+  // resources. Default to full — the common case for your own client.
+  const [mode, setMode] = useState<"full" | "limited">("full");
 
   const selfHosted = useDeploymentInfo()?.selfHosted ?? true;
 
@@ -146,6 +148,19 @@ function McpAuthorizeInner() {
 
   const busy = submitting !== null || orgSwitching;
 
+  const orgName = orgs.find((o) => o.id === orgId)?.name ?? "this organization";
+  // limited + nothing picked would send zero grants → full access, which
+  // contradicts the choice. Block it and steer the user.
+  const limitedButEmpty = mode === "limited" && grants.length === 0;
+  const summary =
+    mode === "full"
+      ? readOnly
+        ? `Read-only access to everything in ${orgName}.`
+        : `Full access to ${orgName} — deploy, create, and manage any resource.`
+      : limitedButEmpty
+        ? "Pick at least one resource below, or switch to Full access."
+        : `Limited to ${grants.length} resource${grants.length === 1 ? "" : "s"} in ${orgName}${readOnly ? ", read-only" : ""}.`;
+
   const act = useCallback(
     async (accept: boolean) => {
       setError(null);
@@ -157,7 +172,9 @@ function McpAuthorizeInner() {
           await tokensApi.mcpAuthorize({
             clientId,
             readOnly,
-            grants,
+            // Full access → no resource grants (acts with the user's role);
+            // limited → only the picked grants.
+            grants: mode === "limited" ? grants : [],
             organizationId: orgId ?? undefined,
           });
         }
@@ -177,7 +194,7 @@ function McpAuthorizeInner() {
         setSubmitting(null);
       }
     },
-    [clientId, readOnly, grants, orgId, consentCode, router, searchParams],
+    [clientId, readOnly, grants, mode, orgId, consentCode, router, searchParams],
   );
 
   // Not signed in → bounce to login, returning here afterward.
@@ -218,9 +235,9 @@ function McpAuthorizeInner() {
         </div>
       </div>
 
-      {/* Body — identity + access level (left) · resource scope (right, wide). */}
+      {/* Body — identity + org (left) · access level (right, wide). */}
       <div className="grid gap-5 lg:grid-cols-[300px_minmax(0,1fr)] lg:items-start">
-        {/* LEFT — who + how much */}
+        {/* LEFT — who + which org */}
         <div className="space-y-4">
           <div className="rounded-xl border border-border/50 bg-muted/20 p-4 text-sm">
             <p className="text-muted-foreground">
@@ -230,19 +247,9 @@ function McpAuthorizeInner() {
             <p className="mt-2 break-all text-muted-foreground">
               Client <span className="font-mono text-xs text-foreground">{clientId}</span>
             </p>
-            {scopes.length > 0 && (
-              <div className="mt-3">
-                <p className="text-xs font-medium text-foreground">Requested access</p>
-                <ul className="mt-1 space-y-1">
-                  {scopes.map((s) => (
-                    <li key={s} className="font-mono text-xs text-muted-foreground">{s}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
           </div>
 
-          {/* Organization — the token acts ONLY within this org. Switching it
+          {/* Organization — the client acts ONLY within this org. Switching it
               changes your active workspace so the scope below matches. */}
           {orgs.length > 0 && (
             <div className="rounded-xl border border-border/50 p-4">
@@ -274,9 +281,39 @@ function McpAuthorizeInner() {
               )}
             </div>
           )}
+        </div>
 
-          {/* Access level — full control by default; read-only is opt-in. */}
-          <label className="flex cursor-pointer select-none items-start gap-3 rounded-xl border border-border/50 p-4">
+        {/* RIGHT — access level: explicit Full vs Limited so what's granted is
+            obvious, not implied by an empty picker. */}
+        <div className="space-y-4 rounded-xl border border-border/50 p-5">
+          <div>
+            <h2 className="text-sm font-semibold text-foreground">How much access to grant</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              You can only grant access you already hold yourself.
+            </p>
+          </div>
+
+          {/* Full vs Limited (radio cards) */}
+          <div className="space-y-2">
+            <AccessOption
+              active={mode === "full"}
+              disabled={busy}
+              onClick={() => setMode("full")}
+              title="Full access"
+              badge="Recommended"
+              desc={`Deploy, create, and manage everything in ${orgName} that you can. Best for your own client.`}
+            />
+            <AccessOption
+              active={mode === "limited"}
+              disabled={busy}
+              onClick={() => setMode("limited")}
+              title="Limited access"
+              desc="Restrict the client to only the specific resources you pick below."
+            />
+          </div>
+
+          {/* Read-only modifier — applies to whichever mode is selected. */}
+          <label className="flex cursor-pointer select-none items-start gap-3 rounded-xl border border-border/50 p-3">
             <input
               type="checkbox"
               checked={readOnly}
@@ -287,34 +324,41 @@ function McpAuthorizeInner() {
             <span className="min-w-0">
               <span className="flex items-center gap-1.5 text-sm font-medium text-foreground">
                 <Lock className="size-3.5 text-muted-foreground" />
-                Read-only access
+                Read-only
               </span>
               <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
-                The client can view but not deploy, change, or delete anything. Leave this off to
-                let it deploy and manage resources.
+                The client can view but not deploy, change, or delete.
               </span>
             </span>
           </label>
-        </div>
 
-        {/* RIGHT — resource scope (the wide part). Enforced through the same
-            grant model as a PAT. */}
-        <div className="space-y-3 rounded-xl border border-border/50 p-5">
-          <div>
-            <h2 className="text-sm font-semibold text-foreground">What this client can access</h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              You can only grant access you hold yourself. Leave everything unselected to grant the
-              client your full access, or pick resources to scope it down.
-            </p>
+          {/* Limited → resource picker */}
+          {mode === "limited" && (
+            <div className="space-y-3 border-t border-border/40 pt-3">
+              <p className="text-xs text-muted-foreground">
+                Choose the resources this client may access:
+              </p>
+              <ResourcePicker
+                key={orgId ?? "none"}
+                value={grants}
+                onChange={setGrants}
+                availableTypes={grantableTypes(selfHosted)}
+                defaultPermissions={["read", "write"]}
+                disabled={busy}
+              />
+            </div>
+          )}
+
+          {/* Plain-language summary of exactly what this Authorize will grant. */}
+          <div
+            className={`rounded-lg px-3 py-2 text-xs ${
+              limitedButEmpty
+                ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                : "bg-muted/30 text-muted-foreground"
+            }`}
+          >
+            {summary}
           </div>
-          <ResourcePicker
-            key={orgId ?? "none"}
-            value={grants}
-            onChange={setGrants}
-            availableTypes={grantableTypes(selfHosted)}
-            defaultPermissions={["read", "write"]}
-            disabled={busy}
-          />
         </div>
       </div>
 
@@ -330,11 +374,59 @@ function McpAuthorizeInner() {
         <Button variant="outline" disabled={busy} onClick={() => act(false)}>
           {submitting === "deny" ? <Loader2 className="size-4 animate-spin" /> : "Deny"}
         </Button>
-        <Button disabled={busy} onClick={() => act(true)}>
+        <Button disabled={busy || limitedButEmpty} onClick={() => act(true)}>
           {submitting === "accept" ? <Loader2 className="size-4 animate-spin" /> : "Authorize"}
         </Button>
       </div>
     </div>
+  );
+}
+
+/** Radio-style access-mode card (Full / Limited). */
+function AccessOption({
+  active,
+  disabled,
+  onClick,
+  title,
+  desc,
+  badge,
+}: {
+  active: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  title: string;
+  desc: string;
+  badge?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-pressed={active}
+      className={`flex w-full items-start gap-3 rounded-xl border p-4 text-left transition-colors disabled:opacity-60 ${
+        active ? "border-primary/50 bg-primary/[0.06]" : "border-border/50 hover:bg-muted/20"
+      }`}
+    >
+      <span
+        className={`mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border-2 ${
+          active ? "border-primary" : "border-border/60"
+        }`}
+      >
+        {active && <span className="size-2 rounded-full bg-primary" />}
+      </span>
+      <span className="min-w-0">
+        <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+          {title}
+          {badge && (
+            <span className="rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+              {badge}
+            </span>
+          )}
+        </span>
+        <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">{desc}</span>
+      </span>
+    </button>
   );
 }
 
